@@ -1,15 +1,19 @@
 // ==UserScript==
 // @name         知乎-我的回答批量下载
-// @namespace    https://github.com/yourname/zhihu-my-answers
-// @version      1.0.0
-// @description  打开知乎自动获取当前登录账号的全部回答，转 Markdown 打包成单个 zip 下载到指定目录（配合浏览器默认下载目录指向坚果云同步盘即可同步上云）
+// @namespace    https://github.com/zxysdtc/zhihu-my-answers-download
+// @version      1.1.0
+// @description  打开知乎自动获取当前登录账号的全部回答，转 Markdown 打包成单个 zip 下载到指定目录（配合浏览器默认下载目录指向坚果云同步盘即可同步上云）。按钮始终显示，依赖库按需多镜像加载，国内可用。
 // @author       you
 // @match        *://www.zhihu.com/*
 // @match        *://zhuanlan.zhihu.com/*
 // @grant        GM_download
 // @grant        GM_notification
-// @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
-// @require      https://cdn.jsdelivr.net/npm/turndown@7.1.3/dist/turndown.js
+// @grant        GM_xmlhttpRequest
+// @connect      lib.baomitu.com
+// @connect      cdn.bootcdn.net
+// @connect      cdnjs.cloudflare.com
+// @connect      cdn.jsdelivr.net
+// @connect      unpkg.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -18,29 +22,77 @@
 
   // ===================== 可配置项 =====================
   const CONFIG = {
-    // 下载子目录（相对“浏览器默认下载目录”）。把浏览器默认下载目录设为坚果云同步盘即可同步上云。
-    subDir: 'zhihu-answers',
-    // 是否“打开知乎就自动运行”。true=自动；false=只显示按钮手动点。
-    autoRun: false,
-    // 自动运行的最小间隔（小时），避免每次刷新都重下。
-    autoRunIntervalHours: 12,
-    // 每页拉取数量（知乎上限 20）
-    pageLimit: 20,
-    // 每次翻页之间的延迟（毫秒），礼貌一点、降低被限流概率
-    pageDelayMs: 800,
+    subDir: 'zhihu-answers',      // 下载子目录（相对浏览器默认下载目录）
+    autoRun: false,               // 是否“打开知乎就自动运行”
+    autoRunIntervalHours: 12,     // 自动运行最小间隔（小时）
+    pageLimit: 20,                // 每页拉取数量（知乎上限 20）
+    pageDelayMs: 800,             // 翻页延迟（毫秒）
   };
   // ====================================================
 
   const LS_KEY = 'zhihu_my_answers_last_run';
 
-  const turndown = new TurndownService({
-    headingStyle: 'atx',
-    codeBlockStyle: 'fenced',
-    bulletListMarker: '-',
-  });
+  // 依赖库的多镜像地址（按顺序尝试，哪个通用哪个）
+  const LIBS = {
+    JSZip: {
+      global: 'JSZip',
+      urls: [
+        'https://lib.baomitu.com/jszip/3.10.1/jszip.min.js',
+        'https://cdn.bootcdn.net/ajax/libs/jszip/3.10.1/jszip.min.js',
+        'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
+        'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js',
+      ],
+    },
+    TurndownService: {
+      global: 'TurndownService',
+      urls: [
+        'https://lib.baomitu.com/turndown/7.1.2/turndown.js',
+        'https://cdn.bootcdn.net/ajax/libs/turndown/7.1.2/turndown.js',
+        'https://cdnjs.cloudflare.com/ajax/libs/turndown/7.1.2/turndown.js',
+        'https://cdn.jsdelivr.net/npm/turndown@7.1.3/dist/turndown.js',
+        'https://unpkg.com/turndown@7.1.3/dist/turndown.js',
+      ],
+    },
+  };
 
   // ---------- 工具 ----------
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function gmGet(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        timeout: 15000,
+        onload: (r) =>
+          r.status >= 200 && r.status < 300
+            ? resolve(r.responseText)
+            : reject(new Error('HTTP ' + r.status)),
+        onerror: () => reject(new Error('网络错误')),
+        ontimeout: () => reject(new Error('超时')),
+      });
+    });
+  }
+
+  // 多镜像按需加载一个全局库
+  async function ensureLib(name) {
+    const spec = LIBS[name];
+    if (window[spec.global]) return window[spec.global];
+    let lastErr;
+    for (const url of spec.urls) {
+      try {
+        const code = await gmGet(url);
+        // 在全局作用域执行 UMD，库会挂到 window 上
+        new Function(code).call(window);
+        if (window[spec.global]) return window[spec.global];
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw new Error(
+      `依赖库 ${name} 加载失败（所有镜像均不可用）：${lastErr ? lastErr.message : ''}`
+    );
+  }
 
   function sanitize(name) {
     return (name || 'untitled')
@@ -96,7 +148,7 @@
   }
 
   // ---------- 单条回答转 Markdown ----------
-  function answerToMarkdown(a) {
+  function answerToMarkdown(turndown, a) {
     const title = a.question?.title ?? '未知问题';
     const created = a.created_time ? fmtDate(a.created_time * 1000) : '';
     const link = `https://www.zhihu.com/question/${a.question?.id}/answer/${a.id}`;
@@ -117,19 +169,26 @@
 
   // ---------- 打包并下载 ----------
   async function buildAndDownload(me, answers) {
+    const JSZip = await ensureLib('JSZip');
+    const TurndownService = await ensureLib('TurndownService');
+    const turndown = new TurndownService({
+      headingStyle: 'atx',
+      codeBlockStyle: 'fenced',
+      bulletListMarker: '-',
+    });
+
     const zip = new JSZip();
     const used = new Set();
-    answers.forEach((a, idx) => {
+    answers.forEach((a) => {
       const dateStr = a.created_time ? fmtDate(a.created_time * 1000) : '0000-00-00';
       let base = `${dateStr}_${sanitize(a.question?.title)}`;
       let fname = `${base}.md`;
       let n = 1;
       while (used.has(fname)) fname = `${base}_${n++}.md`;
       used.add(fname);
-      zip.file(fname, answerToMarkdown(a));
+      zip.file(fname, answerToMarkdown(turndown, a));
     });
 
-    // 附一个索引
     const indexMd =
       `# ${me.name} 的知乎回答备份\n\n` +
       `导出时间：${fmtDate(Date.now())}　共 ${answers.length} 条\n\n` +
@@ -144,19 +203,17 @@
 
     const blob = await zip.generateAsync({ type: 'blob' });
     const objUrl = URL.createObjectURL(blob);
-    const zipName =
-      `${CONFIG.subDir}/${sanitize(me.name)}_知乎回答_${fmtDate(Date.now())}.zip`;
+    const zipName = `${CONFIG.subDir}/${sanitize(me.name)}_知乎回答_${fmtDate(Date.now())}.zip`;
 
     GM_download({
       url: objUrl,
-      name: zipName, // 含子目录，相对浏览器默认下载目录
+      name: zipName,
       saveAs: false,
       onload: () => {
         URL.revokeObjectURL(objUrl);
         notify('完成', `已下载 ${answers.length} 条回答到 下载目录/${CONFIG.subDir}`);
       },
-      onerror: (e) => {
-        // 回退：普通 a 标签下载（落到默认下载目录根，不带子目录）
+      onerror: () => {
         const a = document.createElement('a');
         a.href = objUrl;
         a.download = zipName.split('/').pop();
@@ -174,10 +231,9 @@
 
   // ---------- 主流程 ----------
   let running = false;
-  async function run(manual) {
+  async function run() {
     if (running) return;
     running = true;
-    const btn = document.getElementById('zmad-btn');
     try {
       setBtn('获取账号中…');
       const me = await fetchMe();
@@ -230,28 +286,24 @@
       fontSize: '13px',
       boxShadow: '0 2px 8px rgba(0,0,0,.2)',
     });
-    btn.onclick = () => run(true);
-    document.body.appendChild(btn);
+    btn.onclick = () => run();
+    (document.body || document.documentElement).appendChild(btn);
   }
 
-  // ---------- 自动运行判断 ----------
   function shouldAutoRun() {
     if (!CONFIG.autoRun) return false;
     const last = Number(localStorage.getItem(LS_KEY) || 0);
-    const gap = CONFIG.autoRunIntervalHours * 3600 * 1000;
-    return Date.now() - last > gap;
+    return Date.now() - last > CONFIG.autoRunIntervalHours * 3600 * 1000;
   }
 
-  // ---------- 启动 ----------
   function init() {
     mountButton();
-    if (shouldAutoRun()) {
-      // 稍等页面稳定再跑
-      setTimeout(() => run(false), 2500);
-    }
+    // SPA 切换路由后按钮可能被移除，定时补挂
+    setInterval(mountButton, 3000);
+    if (shouldAutoRun()) setTimeout(() => run(), 2500);
   }
 
-  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+  if (document.body) {
     init();
   } else {
     window.addEventListener('DOMContentLoaded', init);

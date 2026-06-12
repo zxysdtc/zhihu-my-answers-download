@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         知乎-我的回答批量下载
 // @namespace    https://github.com/zxysdtc/zhihu-my-answers-download
-// @version      1.1.0
+// @version      1.2.0
 // @description  打开知乎自动获取当前登录账号的全部回答，转 Markdown 打包成单个 zip 下载到指定目录（配合浏览器默认下载目录指向坚果云同步盘即可同步上云）。按钮始终显示，依赖库按需多镜像加载，国内可用。
 // @author       you
 // @match        *://www.zhihu.com/*
@@ -19,6 +19,9 @@
 
 (function () {
   'use strict';
+
+  // 启动标记：装好后刷新知乎，在 F12 Console 看到这行即表示脚本已在运行
+  console.log('%c[知乎回答下载] 脚本已加载 v1.2.0，右下角应出现蓝色按钮', 'color:#0066ff;font-weight:bold');
 
   // ===================== 可配置项 =====================
   const CONFIG = {

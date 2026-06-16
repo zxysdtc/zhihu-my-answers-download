@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         知乎-用户回答增量下载
 // @namespace    https://github.com/zxysdtc/zhihu-my-answers-download
-// @version      3.0.0
-// @description  下载任意知乎用户的回答为 Markdown：面板内输入/自动识别目标用户，弹出原生文件夹选择器选择保存目录，文件直接写入该目录；增量更新（只下新增/改动），按用户分别记录。浏览器不支持时回退 GM_download。无外部依赖库。
+// @version      3.1.0
+// @description  下载任意知乎用户的回答为 Markdown：面板内输入/自动识别目标用户，弹出原生文件夹选择器选择保存目录，文件直接写入该目录；目录句柄持久化，下次打开自动恢复无需重选；增量更新（只下新增/改动），按用户分别记录。浏览器不支持时回退 GM_download。无外部依赖库。
 // @author       you
 // @match        *://www.zhihu.com/*
 // @match        *://zhuanlan.zhihu.com/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  console.log('%c[知乎回答下载] 脚本已加载 v3.0.0', 'color:#0066ff;font-weight:bold');
+  console.log('%c[知乎回答下载] 脚本已加载 v3.1.0', 'color:#0066ff;font-weight:bold');
 
   // ===================== 可配置项 =====================
   const CONFIG = {
@@ -35,6 +35,61 @@
   // ---------- 工具 ----------
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const supportFS = typeof window.showDirectoryPicker === 'function';
+
+  // ---------- IndexedDB：持久化目录句柄（FileSystemHandle 可被结构化克隆存储） ----------
+  const IDB_NAME = 'zhihu_dl_db';
+  const IDB_STORE = 'handles';
+  const IDB_KEY = 'dir';
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function idbSet(handle) {
+    try {
+      const db = await idbOpen();
+      await new Promise((res, rej) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        tx.objectStore(IDB_STORE).put(handle, IDB_KEY);
+        tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+      });
+      db.close();
+    } catch (e) { console.warn('[知乎回答下载] 保存目录句柄失败', e); }
+  }
+  async function idbGet() {
+    try {
+      const db = await idbOpen();
+      const h = await new Promise((res, rej) => {
+        const tx = db.transaction(IDB_STORE, 'readonly');
+        const r = tx.objectStore(IDB_STORE).get(IDB_KEY);
+        r.onsuccess = () => res(r.result || null); r.onerror = () => rej(r.error);
+      });
+      db.close();
+      return h;
+    } catch (_) { return null; }
+  }
+  async function idbClear() {
+    try {
+      const db = await idbOpen();
+      await new Promise((res) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        tx.objectStore(IDB_STORE).delete(IDB_KEY); tx.oncomplete = res;
+      });
+      db.close();
+    } catch (_) {}
+  }
+
+  // 查询/请求目录的读写权限。query=true 时只查询不弹窗
+  async function ensurePermission(handle, query) {
+    if (!handle || !handle.queryPermission) return true;
+    const opts = { mode: 'readwrite' };
+    if ((await handle.queryPermission(opts)) === 'granted') return true;
+    if (query) return false; // 仅查询，不弹授权
+    return (await handle.requestPermission(opts)) === 'granted';
+  }
 
   function getStore() { try { return GM_getValue(STORE_KEY, {}) || {}; } catch (_) { return {}; } }
   function setStore(o) { try { GM_setValue(STORE_KEY, o); } catch (_) {} }
@@ -174,15 +229,23 @@
     });
   }
 
-  // ---------- 选择文件夹 ----------
+  // ---------- 选择文件夹（并持久化） ----------
   async function chooseDir() {
     if (!supportFS) { notify('不支持', '当前浏览器不支持文件夹选择器，将使用浏览器默认下载目录'); return; }
     try {
       dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      await idbSet(dirHandle);                 // 持久化，下次自动恢复
       setDirLabel(dirHandle.name);
     } catch (e) {
       if (e && e.name !== 'AbortError') notify('选择目录失败', e.message || String(e));
     }
+  }
+
+  // 点「恢复目录」：对已存句柄请求一次写权限（需用户手势）
+  async function reauthDir() {
+    if (!dirHandle) return;
+    const ok = await ensurePermission(dirHandle, false);
+    setDirLabel(dirHandle.name, ok);
   }
 
   // ---------- 主流程：增量同步指定用户 ----------
@@ -199,6 +262,10 @@
       if (!token) { set('请先填写目标用户 url_token'); running = false; return; }
 
       if (supportFS && !dirHandle) { set('请先点「选择文件夹」'); running = false; return; }
+      // 已恢复的句柄可能权限被降级，写入前确保拿到写权限（需用户手势——本次点击即是）
+      if (dirHandle && !(await ensurePermission(dirHandle, false))) {
+        set('目录写入权限被拒绝，请重新点「选择文件夹」'); running = false; return;
+      }
 
       set('获取用户信息…');
       const user = await fetchUser(token);
@@ -232,9 +299,15 @@
   }
 
   // ---------- 面板 UI ----------
-  function setDirLabel(name) {
+  function setDirLabel(name, granted) {
     const el = document.getElementById('zmad-dir');
-    if (el) el.textContent = name ? `📁 ${name}` : (supportFS ? '未选择目录' : '默认下载目录/' + CONFIG.fallbackSubDir);
+    const reauth = document.getElementById('zmad-reauth');
+    if (el) {
+      if (name) el.textContent = `📁 ${name}` + (granted === false ? '（需恢复授权）' : '');
+      else el.textContent = supportFS ? '未选择目录' : '默认下载目录/' + CONFIG.fallbackSubDir;
+    }
+    // 已恢复了目录但权限未授予时，显示「恢复目录」按钮
+    if (reauth) reauth.style.display = (name && granted === false) ? 'block' : 'none';
   }
   function mountPanel() {
     if (document.getElementById('zmad-panel')) return;
@@ -255,12 +328,24 @@
       '<button id="zmad-go" style="flex:1;padding:6px;border:none;background:#0066ff;color:#fff;border-radius:6px;cursor:pointer">下载</button>' +
       '</div>' +
       '<div id="zmad-dir" style="color:#888;margin-bottom:4px;word-break:break-all"></div>' +
+      '<button id="zmad-reauth" style="display:none;width:100%;padding:6px;margin-bottom:6px;border:1px solid #ff9800;background:#fff;color:#ff9800;border-radius:6px;cursor:pointer">恢复上次目录授权</button>' +
       '<div id="zmad-status" style="color:#555;min-height:16px"></div>';
     (document.body || document.documentElement).appendChild(box);
 
     document.getElementById('zmad-pick').onclick = chooseDir;
     document.getElementById('zmad-go').onclick = sync;
+    document.getElementById('zmad-reauth').onclick = reauthDir;
     setDirLabel('');
+
+    // 恢复上次持久化的目录句柄
+    if (supportFS) {
+      idbGet().then(async (h) => {
+        if (!h) return;
+        dirHandle = h;
+        const granted = await ensurePermission(h, true); // 仅查询，不弹窗
+        setDirLabel(h.name, granted);
+      }).catch(() => {});
+    }
 
     // 自动识别当前主页用户；否则尝试填入当前登录账号
     const urlToken = detectTokenFromUrl();
@@ -285,6 +370,10 @@
   try {
     GM_registerMenuCommand('清空全部增量记录（重新下载）', () => {
       setStore({}); notify('已重置', '增量记录已清空，下次同步会重新下载');
+    });
+    GM_registerMenuCommand('忘记已保存的下载目录', async () => {
+      await idbClear(); dirHandle = null; setDirLabel('');
+      notify('已清除', '下次需重新选择文件夹');
     });
   } catch (_) {}
 
